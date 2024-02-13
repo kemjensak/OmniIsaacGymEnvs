@@ -2,22 +2,18 @@ from omniisaacgymenvs.tasks.base.rl_task import RLTask
 from omniisaacgymenvs.robots.articulations.mobile_franka import MobileFranka
 from omniisaacgymenvs.robots.articulations.views.mobile_franka_view import MobileFrankaView
 
-from omni.isaac.core.objects import VisualCuboid, DynamicSphere, DynamicCuboid
-from omni.isaac.core.prims import RigidPrim, RigidPrimView
+from omni.isaac.core.objects import VisualCuboid
 from omni.isaac.core.utils.prims import get_prim_at_path
-from omni.isaac.core.utils.stage import get_current_stage, add_reference_to_stage
+from omni.isaac.core.utils.stage import get_current_stage
 from omni.isaac.core.utils.torch.transformations import *
 from omni.isaac.core.utils.torch.rotations import get_euler_xyz
 from omni.isaac.core.prims import GeometryPrimView
-from omni.isaac.core.utils.nucleus import get_assets_root_path
-from omni.physx.scripts import deformableUtils, physicsUtils
-from omni.isaac.core.prims.soft.deformable_prim_view import DeformablePrimView
 
 import numpy as np
 import torch
 import math
 
-from pxr import UsdGeom, Gf
+from pxr import UsdGeom
 
 
 class MobileFrankaTask(RLTask):
@@ -57,30 +53,30 @@ class MobileFrankaTask(RLTask):
         control_frequency = 120.0 / self._task_cfg["env"]["controlFrequencyInv"] # 30
         self.dt = 1/control_frequency
 
-        self._num_observations = 39 #23
+        self._num_observations = 32 - 3 - 2 #23
         self._num_actions = 11
         self._num_agents = 1
 
         self.initial_target_pos = np.array([2.0, 0.0, 0.5])
-        self._cuboid_position = torch.tensor([2.0, 0.0, 0.03])
 
         # set the ranges for the target randomization
         self.x_lim = [-3, 3]
         self.y_lim = [-3, 3]
-        self.z_lim = [0.025, 0.026]
+        self.z_lim = [0.2, 1.2]
 
         RLTask.__init__(self, name, env)
         return
 
     def set_up_scene(self, scene) -> None:
-        self.assets_root_path = get_assets_root_path()
-        if self.assets_root_path is None:
-            carb.log_error("Could not find Isaac Sim assets folder")
 
-        self.add_cuboid()
-        self.get_beaker()
         self.get_franka()
-
+        target_cube = VisualCuboid(
+            prim_path=self.default_zero_env_path + "/target_cube",
+            translation=self.initial_target_pos,
+            scale=np.array([0.1, 0.1, 0.1]),
+            color=np.array([1, 0, 0]),
+        )
+        
         super().set_up_scene(scene, replicate_physics=False)
 
         self._mobilefrankas = MobileFrankaView(prim_paths_expr="/World/envs/.*/mobile_franka", name="franka_view")
@@ -90,20 +86,58 @@ class MobileFrankaTask(RLTask):
         scene.add(self._mobilefrankas._lfingers)
         scene.add(self._mobilefrankas._rfingers)
         scene.add(self._mobilefrankas._base)
-        # scene.add(self.deformableView)
         
-        # self._targets = GeometryPrimView(prim_paths_expr="/World/envs/.*/target_cube", name="target_view")
-        self._targets = RigidPrimView(
-            prim_paths_expr="/World/envs/.*/Cuboid/cuboid", name="cuboid_view", reset_xform_properties=False
-        )
+        self._targets = GeometryPrimView(prim_paths_expr="/World/envs/.*/target_cube", name="target_view")
         scene.add(self._targets)
 
-        self._beakers = RigidPrimView(
-            prim_paths_expr="/World/envs/.*/beaker/beaker", name="beaker_view", reset_xform_properties=False
-        )
-        scene.add(self._beakers)
+        self.init_data()
+        return
 
-        # self.init_data()
+    def get_franka(self):
+        mobile_franka = MobileFranka(prim_path=self.default_zero_env_path + "/mobile_franka", name="mobile_franka")
+        self._sim_config.apply_articulation_settings("mobile_franka", get_prim_at_path(mobile_franka.prim_path), self._sim_config.parse_actor_config("mobile_franka"))     
+
+    def init_data(self) -> None:
+        def get_env_local_pose(env_pos, xformable, device):
+            """Compute pose in env-local coordinates"""
+            world_transform = xformable.ComputeLocalToWorldTransform(0)
+            world_pos = world_transform.ExtractTranslation()
+            world_quat = world_transform.ExtractRotationQuat()
+            
+            px = world_pos[0] - env_pos[0]
+            py = world_pos[1] - env_pos[1]
+            pz = world_pos[2] - env_pos[2]
+            qx = world_quat.imaginary[0]
+            qy = world_quat.imaginary[1]
+            qz = world_quat.imaginary[2]
+            qw = world_quat.real
+
+            return torch.tensor([px, py, pz, qw, qx, qy, qz], device=device, dtype=torch.float)
+
+        stage = get_current_stage()
+        hand_pose = get_env_local_pose(self._env_pos[0], UsdGeom.Xformable(stage.GetPrimAtPath("/World/envs/env_0/mobile_franka/panda_link7")), self._device)
+        lfinger_pose = get_env_local_pose(
+            self._env_pos[0], UsdGeom.Xformable(stage.GetPrimAtPath("/World/envs/env_0/mobile_franka/panda_leftfinger")), self._device
+        )
+        rfinger_pose = get_env_local_pose(
+            self._env_pos[0], UsdGeom.Xformable(stage.GetPrimAtPath("/World/envs/env_0/mobile_franka/panda_rightfinger")), self._device
+        )
+
+        finger_pose = torch.zeros(7, device=self._device)
+        finger_pose[0:3] = (lfinger_pose[0:3] + rfinger_pose[0:3]) / 2.0
+        finger_pose[3:7] = lfinger_pose[3:7]
+        hand_pose_inv_rot, hand_pose_inv_pos = (tf_inverse(hand_pose[3:7], hand_pose[0:3]))
+
+        grasp_pose_axis = 1
+        franka_local_grasp_pose_rot, franka_local_pose_pos = tf_combine(hand_pose_inv_rot, hand_pose_inv_pos, finger_pose[3:7], finger_pose[0:3])
+        franka_local_pose_pos += torch.tensor([0, 0.04, 0], device=self._device)
+        self.franka_local_grasp_pos = franka_local_pose_pos.repeat((self._num_envs, 1))
+        self.franka_local_grasp_rot = franka_local_grasp_pose_rot.repeat((self._num_envs, 1))
+
+        # self.franka_default_dof_pos = torch.tensor(
+        #     [1.157, -1.066, -0.155, -2.239, -1.841, 1.003, 0.469, 0.035, 0.035], device=self._device
+        # )
+        #[0.00017897569768976496, -0.7856239589326517, 1.8711715534358575e-05, -2.3559680300009447, -5.8659626880341875e-06, 1.5717616294461347, 0.7853945309207777]
         self.mobile_franka_default_dof_pos = torch.tensor(
             [0.0, 0.0, 0.0, 0.0, -0.7856, 0.0, -2.356, 0.0, 1.572, 0.7854, 0.035, 0.035], device=self._device
         )
@@ -111,35 +145,6 @@ class MobileFrankaTask(RLTask):
         self.target_positions = torch.zeros((self._num_envs, 3), device=self._device)
 
         self.actions = torch.zeros((self._num_envs, self.num_actions), device=self._device)
-        return
-    
-    def add_cuboid(self):
-        cuboid = DynamicCuboid(
-            prim_path=self.default_zero_env_path + "/Cuboid/cuboid",
-            translation=self._cuboid_position,
-            name="cuboid_0",
-            scale=torch.tensor([0.05, 0.05, 0.05]),
-            color=torch.tensor([0.9, 0.6, 0.2]),
-        )
-        self._sim_config.apply_articulation_settings(
-            "cuboid", get_prim_at_path(cuboid.prim_path), self._sim_config.parse_actor_config("cuboid")
-        )
-    
-    def get_beaker(self):
-        _usd_path = self.assets_root_path + "/Isaac/Props/Beaker/beaker_500ml.usd"
-        mesh_path = self.default_zero_env_path + "/beaker"
-        add_reference_to_stage(_usd_path, mesh_path)
-
-        beaker = RigidPrim(
-            prim_path=mesh_path+"/beaker",
-            name="beaker_0",
-            position=torch.tensor([-1.5, 0.2, 0.095]), # 0.5 0.2 0.095
-        )
-        self._sim_config.apply_articulation_settings("beaker", beaker.prim, self._sim_config.parse_actor_config("beaker"))
-    
-    def get_franka(self):
-        mobile_franka = MobileFranka(prim_path=self.default_zero_env_path + "/mobile_franka", name="mobile_franka")
-        self._sim_config.apply_articulation_settings("mobile_franka", get_prim_at_path(mobile_franka.prim_path), self._sim_config.parse_actor_config("mobile_franka"))         
 
     def get_observations(self) -> dict:
         hand_pos, hand_rot = self._mobilefrankas._hands.get_world_poses(clone=False)
@@ -156,18 +161,9 @@ class MobileFrankaTask(RLTask):
         roll, pitch, base_yaw = get_euler_xyz(base_rot)
         base_yaw = base_yaw.unsqueeze(1)
         
-        self.franka_lfinger_pos, _ = self._mobilefrankas._lfingers.get_world_poses(clone=False)
-        self.franka_rfinger_pos, _ = self._mobilefrankas._rfingers.get_world_poses(clone=False)
-        self.franka_lfinger_pos -= self._env_pos
-        self.franka_rfinger_pos -= self._env_pos
-        self.gripper_site_pos = (self.franka_lfinger_pos + self.franka_rfinger_pos)/2.0
-
-        self.beaker_pos, _ = self._beakers.get_world_poses(clone=False)
-        self.target_pos, _ = self._targets.get_world_poses(clone=False)
-        self.target_vel = self._targets.get_velocities(clone=False)
-        self.beaker_pos -= self._env_pos
-        self.target_pos -= self._env_pos
-        
+        base_vel = self._mobilefrankas._base.get_velocities(clone=False)
+        base_vel_xy = base_vel[:, :2]
+        base_angvel_z = base_vel[:, -1].unsqueeze(1)
 
         self.franka_lfinger_pos, self.franka_lfinger_rot = self._mobilefrankas._lfingers.get_world_poses(clone=False)
         self.franka_lfinger_pos = self.franka_lfinger_pos - self._env_pos
@@ -180,19 +176,17 @@ class MobileFrankaTask(RLTask):
             - 1.0
         )
 
-        self.to_target = self.target_pos - self.gripper_site_pos
-        self.target2beaker_pos = self.beaker_pos - self.target_pos
+        self.to_target = self.target_positions - self.franka_lfinger_pos
 
         obs = torch.hstack((
-            base_pos_xy, # 2
-            base_yaw, # 1
-            arm_dof_pos_scaled, # 9
-            franka_dof_vel[:, 3:] * self.dof_vel_scale, # 9
-            self.franka_lfinger_pos, # 3
-            self.franka_rfinger_pos, # 3
-            self.target_pos, # 3
-            self.target_vel, # 6
-            self.beaker_pos, # 3
+            base_pos_xy, 
+            base_yaw, 
+            arm_dof_pos_scaled,
+            #base_vel_xy, 
+            #base_angvel_z, 
+            franka_dof_vel[:, 3:] * self.dof_vel_scale,
+            self.franka_lfinger_pos,
+            self.target_positions
         )).to(dtype=torch.float32)
 
         self.obs_buf = obs
@@ -288,9 +282,6 @@ class MobileFrankaTask(RLTask):
 
     def post_reset(self):
         """setup initial values for dof related things. This is run only once when the environment is initialized."""
-        self.mobile_franka_default_dof_pos = torch.tensor(
-            [0.0, 0.0, 0.0, 0.0, -0.7856, 0.0, -2.356, 0.0, 1.572, 0.7854, 0.035, 0.035], device=self._device
-        )
         self.num_franka_dofs = self._mobilefrankas.num_dof
         self.franka_dof_pos = torch.zeros((self.num_envs, self.num_franka_dofs), device=self._device)
         dof_limits = self._mobilefrankas.get_dof_limits()
@@ -315,42 +306,15 @@ class MobileFrankaTask(RLTask):
         action_penalty = torch.sum(torch.square(self.actions[:, 2:]), dim=-1)
 
         distance_to_target = torch.norm(self.to_target, p=2, dim=-1) # / self.dt
-        distance_to_beaker = torch.norm(self.target2beaker_pos, p=2, dim=-1)
 
         arm_joint_dof_pos = self.franka_dof_pos[:, 3:-2]
         penalty_joint_limit = self._joint_limit_penalty(arm_joint_dof_pos)
-        # penalty_ee_
-
-        current_target_cube_z = self.target_pos[:, 2:3]
-
-        z_lift_level = torch.where(
-            distance_to_beaker < 0.07, torch.zeros_like(current_target_cube_z), torch.ones_like(current_target_cube_z)*0.18
-        )
-        front_lift_error = torch.norm(current_target_cube_z - z_lift_level, p = 2, dim = -1)
-        front_lift_reward = 1.0 / (5*front_lift_error + .025)
-
-        rl_finger_z_diff = torch.norm(self.franka_lfinger_pos[:, 2] - self.franka_rfinger_pos[:, 2], p=2, dim=-1)
-
-        distance_to_floor =self.gripper_site_pos[:, 2]
-        penalty_gripper_floor = torch.where(
-            distance_to_floor < 0.01, torch.ones_like(rl_finger_z_diff)*10, torch.zeros_like(rl_finger_z_diff)
-        )
-        penalty_gripper_floor = torch.norm(penalty_gripper_floor, p=2, dim=-1)
-
+        
         reward = torch.zeros_like(self.rew_buf)
-        reward +=  (0.4 * torch.exp(-1.2 * distance_to_target)
-                 + 0.1 * torch.exp(-1.2 * distance_to_beaker)
-                 + 0.7 * torch.exp(-10.0 * front_lift_error)
-                 + 0.4 * torch.exp(-100.0 * rl_finger_z_diff)
-                 - penalty_gripper_floor
-                #  + 80*front_lift_rewarde
-                 - self.action_penalty_scale * action_penalty
-                 - 0.06 * penalty_joint_limit)
+        reward +=  0.5 * torch.exp(-1.2 * distance_to_target) - self.action_penalty_scale * action_penalty - 0.06 * penalty_joint_limit
         self.extras["rewards/distance_to_target"] = torch.mean(distance_to_target)
         self.extras["rewards/penalty_joint_limit"] = torch.mean(penalty_joint_limit)
         self.extras["rewards/action_penalty"] = torch.mean(action_penalty)
-        self.extras["rewards/distance_to_beaker"] = torch.mean(distance_to_beaker)
-        self.extras["rewards/front_lift_reward"] = torch.mean(front_lift_reward)
         self.rew_buf[:] = reward
     
     def _joint_limit_penalty(self, values):
