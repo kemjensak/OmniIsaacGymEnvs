@@ -59,9 +59,10 @@ class MobileFranka(Robot):
 
         if self._usd_path is None:
             from pathlib import Path
-            current_working_dir = Path.cwd()
-            self._usd_path = str(current_working_dir.parent) + "/assets/ridgeback_franka/ridgeback_franka6_instanceable.usd"
-
+            # current_working_dir = Path.cwd()
+            current_file = Path(__file__)
+            # self._usd_path = str(current_working_dir.parent) + "/assets/ridgeback_franka/ridgeback_franka6_instanceable.usd"
+            self._usd_path = current_file.as_posix().replace("omniisaacgymenvs/robots/articulations/mobile_franka.py", "assets/ridgeback_franka/ridgeback_franka6_instanceable.usd")
 
         add_reference_to_stage(self._usd_path, prim_path)
         
